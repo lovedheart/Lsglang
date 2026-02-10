@@ -76,11 +76,16 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         **extra_weight_attrs,
     ):
         """Create weights for embedding layer."""
+        # from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        # device = torch.cuda.current_device()
+        # if isinstance(layer, VocabParallelEmbedding):
+        #     device = "cpu"
         weight = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
                 input_size_per_partition,
                 dtype=params_dtype,
+                # device=device,
             ),
             requires_grad=False,
         )
@@ -175,6 +180,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         self.with_bias = with_bias
 
         # Fused gate_up_proj (column parallel)
@@ -187,7 +196,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if self.use_triton_kernels:
             w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         w13_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype),
+            torch.empty(num_experts, w13_weight_n, w13_weight_k, dtype=params_dtype, device=device),
             requires_grad=False,
         )
         layer.register_parameter("w13_weight", w13_weight)
@@ -195,7 +204,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         if self.with_bias:
             w13_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, w13_up_dim, dtype=torch.float32),
+                torch.empty(num_experts, w13_up_dim, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             layer.register_parameter("w13_weight_bias", w13_weight_bias)
@@ -209,7 +218,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if self.use_triton_kernels:
             w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         w2_weight = torch.nn.Parameter(
-            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype),
+            torch.empty(num_experts, w2_weight_n, w2_weight_k, dtype=params_dtype, device=device),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight", w2_weight)
@@ -217,13 +226,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.empty(num_experts, hidden_size, dtype=torch.float32),
+                torch.empty(num_experts, hidden_size, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and  layer.is_cpu_layer:
+            return None
         if _use_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),

@@ -127,6 +127,10 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+    if isinstance(module, FusedMoE) and module.is_gpu_resident_layer: 
+        yield module
+        return
     if target_device.type == "cpu":
         # If target is CPU, no need to move anything
         yield module
@@ -152,6 +156,8 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     finally:
         # Restore parameters to their original devices, ignoring new parameters
+        if isinstance(module, FusedMoE) and module.is_gpu_resident_layer:  
+            return
         pin_memory = is_pin_memory_available()
         for name, p in module.named_parameters():
             if name in original_infos:
@@ -682,8 +688,10 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         model.load_weights(weights)
-
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         for _, module in model.named_modules():
+            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                module.process_weights_after_loading()
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading
@@ -695,6 +703,9 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
                 if _is_npu:
                     torch.npu.empty_cache()
+            if isinstance(module, FusedMoE) and not getattr(module, "process_lk_moe_already_called", False):
+                module.clean_weights_after_loading() 
+                setattr(module, "process_lk_moe_already_called", True)
 
 
 class LayeredModelLoader(DefaultModelLoader):

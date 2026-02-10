@@ -91,7 +91,39 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
 
-
+import threading
+from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import MoeComputeStrategy
+from sglang.srt.utils.common import is_lk_moe_feature_enabled, get_moe_compute_strategy, is_lk_moe_cpu_layer, is_lk_moe_gpu_resident_layer, is_lk_moe_gpu_prefill_layer, get_gpu_prefetch_window, get_gpu_prefill_min_batch_size, is_lk_moe_use_gpu_prefill
+if is_lk_moe_feature_enabled():
+    import  lk_moe
+    GGML_TYPE_TO_TORCH_DTYPE = {
+        0: torch.float32,    # GGML_TYPE_F32
+        1: torch.float16,    # GGML_TYPE_F16
+        30: torch.bfloat16,  # GGML_TYPE_BF16 
+    }
+ 
+    SUPPORTED_GGML_QUANT_TYPES = {
+        2,  # GGML_TYPE_Q4_0
+        3,  # GGML_TYPE_Q4_1
+        8,  # GGML_TYPE_Q8_0
+        12, # GGML_TYPE_Q4_K
+        13, # GGML_TYPE_Q5_K
+        14, # GGML_TYPE_Q6_K
+        23, # GGML_TYPE_IQ4_XS
+        24, # GGML_TYPE_I8 
+    }
+ 
+    def is_ggml_type_supported(ggml_type): 
+        if ggml_type in {0, 1, 30}:
+            return True 
+        if ggml_type in SUPPORTED_GGML_QUANT_TYPES:
+            return True
+        return False  
+    
+else:
+    logger.error("Failed to import lk_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
+    
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
@@ -152,6 +184,18 @@ class FusedMoeWeightScaleSupported(Enum):
     GROUP = "group"
     BLOCK = "block"
 
+_current_stream: Optional[torch.cuda.Stream] = None
+
+def get_current_stream() -> Optional[torch.cuda.Stream]: 
+    if not torch.cuda.is_available():
+        return None
+    
+    global _current_stream
+     
+    if _current_stream is None:
+         _current_stream = torch.cuda.current_stream()
+    
+    return _current_stream
 
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
@@ -208,6 +252,16 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
+        
+        self._lk_moe_init_lock = threading.Lock()  
+        
+        self.gpu_prefetch_window = get_gpu_prefetch_window()
+        self.lk_moe = None
+        self.lk_moe_config = None 
+        self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_id) 
+        self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_id)
+        self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_id)
+
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()
@@ -288,6 +342,9 @@ class FusedMoE(torch.nn.Module):
                 self.quant_method = UnquantizedFusedMoEMethod(
                     self.use_triton_kernels, self.use_flashinfer_trtllm_moe
                 )
+                
+        self.max_running_requests = server_args.max_running_requests
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
 
         self.quant_method.create_weights(
             layer=self,
@@ -1007,11 +1064,20 @@ class FusedMoE(torch.nn.Module):
         return final_hidden_states
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         # TODO: consider using symmetric memory
-        return self.quant_method.apply(
-            layer=self,
-            dispatch_output=dispatch_output,
-        )
+        if not self.is_gpu_resident_layer and not self.should_use_gpu_prefill(dispatch_output.hidden_states):
+            output = self.forward_lk( 
+                dispatch_output.hidden_states,
+                dispatch_output.topk_output.topk_weights, 
+                dispatch_output.topk_output.topk_ids,
+            )
+            return StandardCombineInput(hidden_states=output)
+        else:
+            return self.quant_method.apply(
+                layer=self,
+                dispatch_output=dispatch_output,
+            )
 
     @classmethod
     def make_expert_params_mapping(
@@ -1121,7 +1187,1078 @@ class FusedMoE(torch.nn.Module):
             # TODO: remove this branch after MoE refactor
             self.down_gemm_overlap_args = None
             self.meta_overlap_args = None
+            
+    
+    def global_to_local_expert_ids(self, topk_ids): 
+        expert_map = self._expert_map.to(topk_ids.device)
+        max_idx = len(self._expert_map) - 1
+         
+        clamped = torch.clamp(topk_ids, 0, max_idx)
+        result = expert_map[clamped]
+         
+        mask = topk_ids < 0
+        result[mask] = -1
+        
+        return result
+    
+    def should_use_gpu_prefill(self, hidden_states: torch.Tensor) -> bool:  
+        return (not torch.cuda.is_current_stream_capturing() and 
+                self.is_gpu_prefill_layer and 
+                hidden_states.size(0) >= get_gpu_prefill_min_batch_size())   
+            
+    def _get_ggml_type_from_quant_config(self,  quant_config, layer_idx, weight_type):  
+        if layer_idx < len(quant_config.moe_weight_type_map):
+            layer_info = quant_config.moe_weight_type_map[layer_idx]
+            if layer_info and weight_type in layer_info:
+                weight_name = layer_info[weight_type]
+                quant_name_to_type = {
+                    'F32': 0,     # GGML_TYPE_F32
+                    'F16': 1,     # GGML_TYPE_F16
+                    'BF16': 30,   # GGML_TYPE_BF16
+                    'Q4_0': 2,    # GGML_TYPE_Q4_0
+                    'Q4_1': 3,    # GGML_TYPE_Q4_1
+                    'Q8_0': 8,    # GGML_TYPE_Q8_0
+                    'Q4_K': 12,   # GGML_TYPE_Q4_K
+                    'Q5_K': 13,   # GGML_TYPE_Q5_K
+                    'Q6_K': 14,   # GGML_TYPE_Q6_K
+                    'IQ4_XS': 23, # GGML_TYPE_IQ4_XS
+                    'I8': 24,     # GGML_TYPE_I8
+                }
+                return quant_name_to_type.get(weight_name, None)
+            
+        raise ValueError(f"Weight type {layer_idx}.{weight_type} not found in quant_config") 
+    
+    def _zero_tensor(self, tensor: torch.Tensor):
+        if tensor is not None:
+            tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+            
+    def process_weights_after_loading(self):
+        if self.is_gpu_resident_layer:
+            logger.info(f"Initialized lk_moe with {self.moe_runner_config.num_local_experts} experts for layer {self.layer_id} [" + 
+            ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
+            return
+        try:  
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod 
+           
+            find_weight = False  
+            with torch.no_grad():
+                if isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod) \
+                    and hasattr(self.quant_method, 'strategy'):
+    
+                    self._process_compressed_tensors_weights(self.quant_method.strategy)
+                    find_weight = True 
+                     
+                 
+                if isinstance(self.quant_method, Fp8MoEMethod):
+                    strategy = get_moe_compute_strategy()
+                    if strategy == MoeComputeStrategy.KEEP:
+                        self._process_fp8_weights(self.quant_method.block_quant)
+                    elif strategy == MoeComputeStrategy.TO_DTYPE:
+                        self._process_block_weights()
+                    else:
+                        self._process_block_weights_quant(strategy)
+                    find_weight = True
+                    
+                if isinstance(self.quant_method, CompressedTensorsW8A8Fp8MoEMethod):
+                    strategy = get_moe_compute_strategy()
+                    if strategy == MoeComputeStrategy.KEEP:
+                        self._process_fp8_weights(False)
+                    elif strategy == MoeComputeStrategy.TO_DTYPE:
+                        self._process_channel_weights() 
+                    else:
+                        self._process_channel_weights_quant(strategy)
+                    find_weight = True
+                if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
+                    self._process_regular_weights()
+                    find_weight = True
+                
+                if not find_weight: 
+                    logger.error("weight not found in layer, quant_method: %s", self.quant_method) 
+                    return
+                
+                self._initialize_cuda_graph_buffers()
+                logger.info(f"Initialized lk_moe with {self.moe_runner_config.num_local_experts} experts for layer {self.layer_id} [" + 
+                ("CPU" if not self.is_gpu_resident_layer else "GPU") + "]")
+        except Exception as e:
+            logger.error(f"Failed to initialize lk_moe: {e}") 
+            self.lk_moe = None
+            self.lk_moe_config = None
+    
+    def distribute_weight_tensor(self, param_name: str, weight: torch.Tensor):  
+        with torch.no_grad():
+            origin_dtype = weight.dtype
+            origin_shape = weight.shape
+            setattr(self, param_name + "_origin_dtype", origin_dtype)
+            setattr(self, param_name + "_origin_shape", origin_shape) 
+            
+            shape_array = torch.tensor(origin_shape, dtype=torch.int64).contiguous()
+            
+            self.lk_moe.distributeWeight(param_name, weight.contiguous().data_ptr(), shape_array.data_ptr(), weight[0].nbytes)
+            
+            del shape_array 
+            
+    def clean_weights_after_loading(self):
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
+        from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod 
+            
+        if self.is_gpu_resident_layer:
+            return
+        try:  
+            with torch.no_grad():
+                if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
+                    del self.w13_weight, self.w2_weight
+                    
+                if isinstance(self.quant_method, Fp8MoEMethod):
+                    param_names = [
+                        "w13_weight",
+                        "w2_weight",  
+                    ]
+                    scale_names = [
+                        "w13_weight_scale_inv" if self.quant_method.block_quant else "w13_weight_scale",
+                        "w2_weight_scale_inv" if self.quant_method.block_quant else "w2_weight_scale",  
+                    ]
+                    quant_config_names = [
+                        "w1_scale",
+                        "w2_scale",
+                    ]
 
+                    if self.is_cpu_layer:
+                        for param_name in param_names: 
+                            if hasattr(self, param_name):
+                                delattr(self, param_name)
+                        for scale_name in scale_names:
+                            if hasattr(self, scale_name):
+                                delattr(self, scale_name)
+                        for quant_config_name in quant_config_names:
+                            if hasattr(self, "moe_quant_config") and hasattr(self.moe_quant_config, quant_config_name):
+                                delattr(self.moe_quant_config, quant_config_name)
+                    else: 
+                        for param_name in param_names: 
+                            if hasattr(self, param_name):
+                                weight = getattr(self, param_name) 
+                                self.distribute_weight_tensor(param_name, weight) 
+                                setattr(self, param_name, torch.nn.Parameter(
+                                    torch.empty(0, device=torch.cuda.current_device()), 
+                                    requires_grad=False
+                                ))
+                         
+                        has_quant_config = (
+                            hasattr(self, "moe_quant_config") and 
+                            hasattr(self.moe_quant_config, quant_config_names[0]) and
+                            hasattr(self.moe_quant_config, quant_config_names[1])
+                        )
+                        
+                        if has_quant_config: 
+                            for scale_name in quant_config_names:
+                                if hasattr(self.moe_quant_config, scale_name):
+                                    weight = getattr(self.moe_quant_config, scale_name) 
+                                    self.distribute_weight_tensor(scale_name, weight)
+                                    setattr(self.moe_quant_config, scale_name, 
+                                        torch.nn.Parameter(
+                                            torch.empty(0, device=torch.cuda.current_device()), 
+                                            requires_grad=False
+                                        ))
+                             
+                            for scale_name in scale_names:
+                                if hasattr(self, scale_name):
+                                    delattr(self, scale_name)
+                        else: 
+                            for scale_name in scale_names:
+                                if hasattr(self, scale_name):
+                                    weight = getattr(self, scale_name) 
+                                    self.distribute_weight_tensor(scale_name, weight) 
+                                    setattr(self, scale_name, 
+                                        torch.nn.Parameter(
+                                            torch.empty(0, device=torch.cuda.current_device()), 
+                                            requires_grad=False
+                                        ))
+                                
+                if isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod) \
+                    and hasattr(self.quant_method, 'strategy'):
+                    param_names = [
+                        "w13_weight_packed",
+                        "w2_weight_packed", 
+                        "w13_weight_scale",
+                        "w2_weight_scale", 
+                        "w13_weight_g_idx",
+                        "w2_weight_g_idx",
+                        "w13_g_idx_sort_indices",
+                        "w2_g_idx_sort_indices",
+                        "w13_weight_shape",
+                        "w2_weight_shape", 
+                    ] 
+        
+                    if self.is_cpu_layer: 
+                        for param_name in param_names: 
+                            delattr(self, param_name) 
+                    else:
+                        for param_name in param_names: 
+                            weight = getattr(self, param_name) 
+                            self.distribute_weight_tensor(param_name, weight) 
+                            setattr(self, param_name, torch.nn.Parameter(torch.empty(0,  device=torch.cuda.current_device()), requires_grad=False))
+                
+            import gc
+            gc.collect()
+        except Exception as e:
+            logger.error(f"Failed to initialize lk_moe: {e}") 
+            self.lk_moe = None
+            self.lk_moe_config = None
+            
+    def get_ggml_type_from_dtype(self, dtype):
+            if dtype == torch.float32:
+                return 0  # GGML_TYPE_F32
+            elif dtype == torch.float16:
+                return 1  # GGML_TYPE_F16
+            elif dtype == torch.bfloat16:
+                return 30  # GGML_TYPE_BF16
+            else:
+                raise ValueError(f"Unsupported dtype {dtype}")
+    
+    def _get_processes_info(self) -> tuple[int, int]: 
+        if self.moe_ep_size > self.moe_tp_size:
+            return self.moe_ep_size, self.moe_ep_rank  
+        return self.moe_tp_size, self.moe_tp_rank    
+                   
+    def _process_gguf_weights(self):  
+  
+        layer_idx = self.layer_id
+        gate_ggml_type = self._get_ggml_type_from_quant_config(self.quant_config, layer_idx, 'gate')
+        up_ggml_type = self._get_ggml_type_from_quant_config(self.quant_config, layer_idx, 'up')
+        down_ggml_type = self._get_ggml_type_from_quant_config(self.quant_config, layer_idx, 'down')
+        
+        assert gate_ggml_type == up_ggml_type, f"Gate and Up weights must have the same GGML type, got {gate_ggml_type} and {up_ggml_type}"
+  
+        if not is_ggml_type_supported(gate_ggml_type) or not is_ggml_type_supported(up_ggml_type) or not is_ggml_type_supported(down_ggml_type) \
+            or gate_ggml_type != up_ggml_type:  
+            raise ValueError(f"GGML type {gate_ggml_type} or {up_ggml_type} or {down_ggml_type} is not supported for layer {layer_idx}")
+             
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+        w13_ggml_type = gate_ggml_type
+        w2_ggml_type = down_ggml_type
+        
+        num_experts, total_intermediate_size, hidden_size = self.w13_qweight.shape
+        intermediate_size = total_intermediate_size // 2
+        assert intermediate_size == self.intermediate_size_per_partition, f"Intermediate size {intermediate_size} must be equal to intermediate_size_per_partition {self.intermediate_size_per_partition}"
+        assert self.w2_qweight.shape == (num_experts, self.hidden_size, self.w2_qweight.shape[2]), f"Down weight shape {self.w2_qweight.shape} must be (num_experts, hidden_size, w2_qweight.shape[2])"
+        
+        
+        w13_ptr = self.w13_qweight.contiguous().data_ptr()
+        
+        w2_ptr = self.w2_qweight.contiguous().data_ptr()
+        
+        num_processes, process_id = self._get_processes_info()
+        
+        self.lk_moe_config = lk_moe.MOEConfig(
+            num_processes,                # num_processes
+            process_id,                   # process_id
+            num_experts,        # expert_num
+            self.top_k,                    # routed_expert_num
+            self.hidden_size,              # hidden_size
+            self.intermediate_size_per_partition,             # intermediate_size
+            32,                            # stride
+            10,                            # group_min_len
+            1024,                          # group_max_len
+            hidden_ggml_type,           
+            w13_ggml_type,                # gate_type  
+            w2_ggml_type,                # down_type   
+            w13_ptr,                 # w13_ptr 
+            w2_ptr,                 # w2_ptr
+        )
+        self.lk_moe = lk_moe.MOE(self.lk_moe_config) 
+          
+        del w13_ptr, w2_ptr
+        del self.w13_qweight, self.w2_qweight
+ 
+        import gc
+        gc.collect() 
+        
+    
+    def _block_scale_broadcast_fixed(self, scale, target_shape, group_shape): 
+        if torch.is_tensor(group_shape): 
+            group_shape = group_shape.tolist()
+       
+        target_rows, target_cols = target_shape
+        block_rows, block_cols = group_shape
+         
+        num_groups_m = target_rows // block_rows
+        num_groups_n = target_cols // block_cols
+         
+        assert scale.shape == (num_groups_m, num_groups_n) 
+         
+        scale_expanded = scale.repeat_interleave(block_rows, dim=0) 
+        scale_expanded = scale_expanded.repeat_interleave(block_cols, dim=1)
+         
+        assert scale_expanded.shape == (target_rows, target_cols) 
+        
+        return scale_expanded
+     
+    def _process_compressed_tensors_weights(self, strategy: str): 
+         
+        w13_weight = self.w13_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
+        w2_weight = self.w2_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
+        w13_scale = self.w13_weight_scale.cpu().transpose(1, 2).contiguous()
+        w2_scale = self.w2_weight_scale.cpu().transpose(1, 2).contiguous() 
+        
+        from compressed_tensors.quantization import QuantizationStrategy
+      
+        if strategy == QuantizationStrategy.GROUP:
+           pass
+            
+        elif strategy == QuantizationStrategy.BLOCK:
+            pass
+        else:
+            raise ValueError("compressed Weights are not supported for lk moe ...")
+        
+ 
+        
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+        scale_ggml_type = self.get_ggml_type_from_dtype(w13_scale.dtype)
+        
+        group_size = self.quant_method.group_size        # 32
+        num_bits = self.quant_method.num_bits            # 4
+        packed_factor = self.quant_method.packed_factor  # 8 （bit)
+         
+ 
+        weights_per_container = packed_factor // num_bits  # 2
+ 
+        num_experts, total_intermediate_size, compressed_hidden_dim = w13_weight.shape
+ 
+        intermediate_size = total_intermediate_size // 2
+        hidden_size = compressed_hidden_dim * weights_per_container 
+ 
+        expected_w2_shape = (
+            num_experts,
+            hidden_size,
+            intermediate_size // weights_per_container
+        )
+
+        assert w2_weight.shape == expected_w2_shape, \
+            f"w2_weight {w2_weight.shape} != {expected_w2_shape}"
+ 
+        expected_w13_scale_shape = (
+            num_experts,
+            total_intermediate_size,
+            hidden_size // group_size
+        )
+
+        expected_w2_scale_shape = (
+            num_experts,
+            hidden_size,
+            intermediate_size // group_size
+        )
+
+        assert w13_scale.shape == expected_w13_scale_shape, \
+            f"w13_scale {w13_scale.shape} != {expected_w13_scale_shape}"
+        assert w2_scale.shape == expected_w2_scale_shape, \
+            f"w2_scale {w2_scale.shape} != {expected_w2_scale_shape}"
+        
+        w13_weight_ptr = w13_weight.contiguous().data_ptr()
+        w2_weight_ptr = w2_weight.contiguous().data_ptr()
+        if w13_scale.dtype == torch.bfloat16:
+            w13_scale = w13_scale.to(torch.float16, copy=True).contiguous()
+            w2_scale = w2_scale.to(torch.float16, copy=True).contiguous()
+            
+            w13_weight_scale_ptr = w13_scale.data_ptr()
+            w2_weight_scale_ptr = w2_scale.data_ptr()
+            scale_ggml_type = 1
+        else:
+            w13_weight_scale_ptr = w13_scale.contiguous().data_ptr()
+            w2_weight_scale_ptr = w2_scale.contiguous().data_ptr()
+        
+        num_processes, process_id = self._get_processes_info()
+        
+        self.lk_moe_config = lk_moe.MOE_WNA16RepackConfig(
+            num_processes,                # num_processes
+            process_id,                   # process_id
+            self.moe_runner_config.num_local_experts,        # expert_num
+            self.top_k,                    # routed_expert_num
+            self.hidden_size,                   # hidden_size
+            self.intermediate_size_per_partition,             # intermediate_size
+            32,                            # stride
+            10,                            # group_min_len
+            1024,                         # group_max_len
+            hidden_ggml_type,              # hidden_type 
+            2,
+            2,
+            w13_weight_ptr,                     # w13_weight_ptr 
+            w2_weight_ptr,                       # w2_weight_ptr   
+            w13_weight_scale_ptr,               # w13_weight_scale_ptr
+            w2_weight_scale_ptr,                 # w2_weight_scale_ptr
+            scale_ggml_type,
+            1,
+            group_size, 
+            packed_factor,                        # packed_factor
+            num_bits,                        # num_bits
+            group_size,                        # group_size
+        ) 
+        self.lk_moe = lk_moe.MOE_WNA16Repack(self.lk_moe_config) 
+         
+        
+        del w13_weight_ptr, w2_weight_ptr
+        del w13_weight, w2_weight, w13_scale, w2_scale 
+    
+        import gc
+        gc.collect()
+            
+    
+    
+    def _process_awq_weights(self): 
+        
+        w13_qweight = self.w13_qweight
+        w2_qweight = self.w2_qweight
+        w13_scales = self.w13_scales
+        w2_scales = self.w2_scales
+        w13_qzeros = self.w13_qzeros
+        w2_qzeros = self.w2_qzeros
+        ValueError("AWQ Weights are not supported for lk moe ...") 
+         
+ 
+    def _process_fp8_weights(self, block_quant: bool):   
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+        num_experts, total_intermediate_size, hidden_size = w13_weight.shape
+        intermediate_size = total_intermediate_size // 2 
+        assert w2_weight.shape == (num_experts, hidden_size, intermediate_size), f"Down weight shape {w2_weight.shape} must be (num_experts, hidden_size, intermediate_size)"
+        
+        if block_quant:
+            w13_weight_scale = self.w13_weight_scale_inv
+            w2_weight_scale = self.w2_weight_scale_inv
+            if not w13_weight_scale.dtype == torch.float32 or not w2_weight_scale.dtype == torch.float32:
+                raise ValueError("scale type are not supported for lk moe ...")
+            group_shape = self.quant_method.quant_config.weight_block_size
+            groupN, groupK = group_shape 
+            scale_num_experts, scale_total_N, scale_K = w13_weight_scale.shape
+            scale_N = scale_total_N // 2
+            assert w2_weight_scale.shape == (scale_num_experts, scale_K, scale_N), f"Down weight scale shape {w2_weight_scale.shape} must be (scale_num_experts, scale_K, scale_N)"
+        else:
+            groupN, groupK = 1, -1
+            w13_weight_scale = self.w13_weight_scale
+            w2_weight_scale = self.w2_weight_scale
+            scale_num_experts, scale_total_N, scale_K = w13_weight_scale.shape 
+            assert w13_weight_scale.shape == (scale_num_experts, intermediate_size * 2 , 1), f"Up weight scale shape {w13_weight_scale.shape} must be (scale_num_experts, intermediate_size * 2 , 1)"
+            assert w2_weight_scale.shape == (scale_num_experts, hidden_size , 1), f"Down weight scale shape {w2_weight_scale.shape} must be (scale_num_experts, hidden_size , 1)"
+         
+        
+        scale_ggml_type = self.get_ggml_type_from_dtype(w13_weight_scale.dtype)
+         
+        w13_weight_ptr = w13_weight.contiguous().data_ptr()
+        w2_weight_ptr = w2_weight.contiguous().data_ptr()
+        w13_weight_scale_ptr = w13_weight_scale.contiguous().data_ptr()
+        w2_weight_scale_ptr = w2_weight_scale.contiguous().data_ptr()
+        
+        num_processes, process_id = self._get_processes_info()
+        
+        self.lk_moe_config = lk_moe.MOE_FP8Config(
+            num_processes,                # num_processes
+            process_id,                   # process_id
+            self.moe_runner_config.num_local_experts,        # expert_num
+            self.top_k,                    # routed_expert_num
+            self.hidden_size,                   # hidden_size
+            self.intermediate_size_per_partition,             # intermediate_size
+            32,                            # stride
+            10,                            # group_min_len
+            1024,                          # group_max_len
+            hidden_ggml_type,              # hidden_type 
+            8,
+            8,
+            w13_weight_ptr,                     # w13_weight_ptr 
+            w2_weight_ptr,                       # w2_weight_ptr   
+            w13_weight_scale_ptr,               # w13_weight_scale_ptr
+            w2_weight_scale_ptr,                 # w2_weight_scale_ptr 
+            scale_ggml_type,
+            groupN,                        # groupN
+            groupK,                        # groupK
+        )
+        self.lk_moe = lk_moe.MOE_FP8(self.lk_moe_config) 
+          
+        del w13_weight_ptr, w2_weight_ptr, w13_weight_scale_ptr, w2_weight_scale_ptr
+        del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
+        
+
+   
+    def _process_block_weights_quant(self, moe_compute_strategy: MoeComputeStrategy):  
+        
+        if moe_compute_strategy not in {MoeComputeStrategy.INT4, MoeComputeStrategy.INT8}:
+            print(f"Warning: moe_compute_strategy {moe_compute_strategy} is not supported for lk moe , use INT4 instead ...")
+            moe_compute_strategy = MoeComputeStrategy.INT4
+        
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_weight_scale_inv = self.w13_weight_scale_inv
+        w2_weight_scale_inv = self.w2_weight_scale_inv
+        
+        group_shape = self.quant_method.quant_config.weight_block_size
+        num_experts, total_intermediate_size, hidden_size = w13_weight.shape
+        intermediate_size = total_intermediate_size // 2
+         
+        assert w2_weight.shape == (num_experts, hidden_size, intermediate_size)
+        
+        dequant_device = w13_weight.device
+        w13_fp32_list = []
+        w2_fp32_list = [] 
+         
+        for expert_idx in range(num_experts): 
+            expert_w13_weight = w13_weight[expert_idx]
+            expert_w13_scale_inv = w13_weight_scale_inv[expert_idx]
+            expert_w2_weight = w2_weight[expert_idx]
+            expert_w2_scale_inv = w2_weight_scale_inv[expert_idx]
+             
+            w13_float = expert_w13_weight.to(dtype=torch.float32)
+            w2_float = expert_w2_weight.to(dtype=torch.float32)
+            
+            w13_scale_inv_expanded = self._block_scale_broadcast_fixed(
+                expert_w13_scale_inv, w13_float.shape, group_shape)
+            w13_fp32 = w13_float * w13_scale_inv_expanded
+            
+            w2_scale_inv_expanded = self._block_scale_broadcast_fixed(
+                expert_w2_scale_inv, w2_float.shape, group_shape)
+            w2_fp32 = w2_float * w2_scale_inv_expanded
+             
+            w13_fp32_list.append(w13_fp32)
+            w2_fp32_list.append(w2_fp32) 
+             
+            del expert_w13_weight, expert_w13_scale_inv, expert_w2_weight, expert_w2_scale_inv
+            del w13_float, w2_float, w13_scale_inv_expanded, w2_scale_inv_expanded
+            del w13_fp32, w2_fp32
+         
+        w13_fp32_tensor = torch.stack(w13_fp32_list, dim=0).cpu()
+        w2_fp32_tensor = torch.stack(w2_fp32_list, dim=0).cpu() 
+         
+        w13_fp32_list.clear()  # Python 3.3+
+        w2_fp32_list.clear()
+        del w13_fp32_list, w2_fp32_list
+         
+        w13_weight_ptr = w13_fp32_tensor.contiguous().data_ptr()
+        w2_weight_ptr = w2_fp32_tensor.contiguous().data_ptr()
+          
+         
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+         
+        group_size = getattr(self.quant_method, 'group_size', 32)
+        num_bits = 4 if moe_compute_strategy == MoeComputeStrategy.INT4 else 8
+         
+        num_processes, process_id = self._get_processes_info()
+         
+        self.lk_moe_config = lk_moe.MOE_QuantConfig(
+            num_processes,                     # num_processes
+            process_id,                        # process_id
+            self.moe_runner_config.num_local_experts,            # expert_num
+            self.top_k,                        # routed_expert_num
+            self.hidden_size,                  # hidden_size
+            self.intermediate_size_per_partition,  # intermediate_size
+            32,                                # stride
+            10,                                # group_min_len
+            1024,   # group_max_len
+            hidden_ggml_type,                  # hidden_type 
+            0,                                 # w13_weight_data_type: 0 for fp32
+            0,                                # w2_weight_data_type: 0 for fp32
+            w13_weight_ptr,                    # w13_weight_ptr 
+            w2_weight_ptr,                     # w2_weight_ptr   
+            group_size,                        # group_size 
+            num_bits,                          # num_bits 
+        )
+         
+        self.lk_moe = lk_moe.MOE_Quant(self.lk_moe_config)
+         
+          
+        del w13_weight_ptr, w2_weight_ptr
+        del w13_fp32_tensor, w2_fp32_tensor
+        
+        import gc
+        gc.collect()
+    
+    def _process_block_weights(self):  
+ 
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_weight_scale_inv = self.w13_weight_scale_inv
+        w2_weight_scale_inv = self.w2_weight_scale_inv
+        
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+        w13_ggml_type = hidden_ggml_type
+        w2_ggml_type = hidden_ggml_type
+            
+        w13_projs = []
+        w2_projs = [] 
+        
+        group_shape = self.quant_method.quant_config.weight_block_size
+
+             
+        num_experts, total_intermediate_size, hidden_size = w13_weight.shape
+        intermediate_size = total_intermediate_size // 2 
+        assert w2_weight.shape == (num_experts, hidden_size, intermediate_size), f"Down weight shape {w2_weight.shape} must be (num_experts, hidden_size, intermediate_size)"
+        
+        scale_num_experts, scale_total_intermediate_size, scale_hidden_size = w13_weight_scale_inv.shape
+        scale_intermediate_size = scale_total_intermediate_size // 2
+        
+        assert w2_weight_scale_inv.shape == (scale_num_experts, scale_hidden_size, scale_intermediate_size), f"Down weight scale shape {w2_weight_scale_inv.shape} must be (scale_num_experts, scale_hidden_size, scale_intermediate_size)"
+        
+        dequant_device = w2_weight.device
+        w13_buf = torch.zeros(intermediate_size, hidden_size, dtype=torch.float32, device=dequant_device, requires_grad=False) 
+        w2_buf = torch.zeros(hidden_size, intermediate_size, dtype=torch.float32, device=dequant_device, requires_grad=False)
+        
+        for expert_idx in range(num_experts): 
+            expert_w13_weight = w13_weight[expert_idx].to(dequant_device)  # torch.Size([1024, 2048])
+            expert_w13_scale_inv = w13_weight_scale_inv[expert_idx].to(dequant_device)  # torch.Size([8, 16]) 
+            expert_w2_weight = w2_weight[expert_idx].to(dequant_device)   # torch.Size([2048, 512])
+            expert_w2_scale_inv = w2_weight_scale_inv[expert_idx].to(dequant_device) #  torch.Size([16, 4])  
+                
+                
+            w13_float = expert_w13_weight.to(dtype=torch.float32)
+            w2_float = expert_w2_weight.to(dtype=torch.float32) 
+             
+            w13_scale_inv_expanded = self._block_scale_broadcast_fixed(
+                expert_w13_scale_inv, w13_float.shape, group_shape)
+            w13_buf = w13_float * w13_scale_inv_expanded
+              
+             
+            w2_scale_inv_expanded = self._block_scale_broadcast_fixed(
+                expert_w2_scale_inv, w2_float.shape, group_shape)
+            w2_buf = w2_float * w2_scale_inv_expanded
+            
+            w13_projs.append(w13_buf.to(dtype=self.moe_runner_config.params_dtype)) 
+            w2_projs.append(w2_buf.to(dtype=self.moe_runner_config.params_dtype))
+            
+            del expert_w13_weight, expert_w13_scale_inv, expert_w2_weight, expert_w2_scale_inv
+            del w13_float, w2_float, w13_scale_inv_expanded, w2_scale_inv_expanded
+            del w13_buf, w2_buf  
+                 
+        w13_tensor = torch.stack(w13_projs, dim=0).to('cpu')
+        w2_tensor = torch.stack(w2_projs, dim=0).to('cpu') 
+        
+        w13_projs.clear()
+        w2_projs.clear()
+        
+        del w13_projs, w2_projs  
+        
+        w13_ptr = w13_tensor.contiguous().data_ptr()
+        w2_ptr = w2_tensor.contiguous().data_ptr()
+     
+        num_processes, process_id = self._get_processes_info()
+        
+        self.lk_moe_config = lk_moe.MOEConfig(
+            num_processes,                # num_processes
+            process_id,                   # process_id
+            self.moe_runner_config.num_local_experts,        # expert_num
+            self.top_k,                    # routed_expert_num
+            self.hidden_size,              # hidden_size
+            self.intermediate_size_per_partition,             # intermediate_size
+            32,                            # stride
+            10,                            # group_min_len
+            1024,                          # group_max_len 
+            hidden_ggml_type,                # hidden_type 
+            w13_ggml_type,                  # w13_type  
+            w2_ggml_type,                # w2_type   
+            w13_ptr,                 # w13_proj
+            w2_ptr,                   # w2_proj 
+        )
+        self.lk_moe = lk_moe.MOE(self.lk_moe_config)
+         
+        del w13_ptr, w2_ptr
+        del w13_weight, w2_weight, w13_weight_scale_inv, w2_weight_scale_inv
+             
+        import gc
+        gc.collect()
+         
+    def _process_channel_weights_quant(self, moe_compute_strategy: MoeComputeStrategy):  
+    
+        if moe_compute_strategy not in {MoeComputeStrategy.INT4, MoeComputeStrategy.INT8}:
+            print(f"Warning: moe_compute_strategy {moe_compute_strategy} is not supported for lk moe , use INT4 instead ...")
+            moe_compute_strategy = MoeComputeStrategy.INT4
+        
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_weight_scale = self.w13_weight_scale
+        w2_weight_scale = self.w2_weight_scale
+        
+        num_experts, total_intermediate_size, hidden_size = w13_weight.shape
+        intermediate_size = total_intermediate_size // 2 
+         
+        assert w2_weight.shape == (num_experts, hidden_size, intermediate_size)
+         
+        assert w13_weight_scale.shape == (num_experts, total_intermediate_size, 1)
+        assert w2_weight_scale.shape == (num_experts, hidden_size, 1)
+        
+        dequant_device = w13_weight.device
+        w13_fp32_list = []
+        w2_fp32_list = [] 
+        
+        for expert_idx in range(num_experts): 
+            expert_w13_weight = w13_weight[expert_idx].to(dequant_device)  # [intermediate_size, hidden_size]
+            expert_w13_scale = w13_weight_scale[expert_idx].to(dequant_device)  # [total_intermediate_size, 1]
+            expert_w2_weight = w2_weight[expert_idx].to(dequant_device)  # [hidden_size, intermediate_size]
+            expert_w2_scale = w2_weight_scale[expert_idx].to(dequant_device)  # [hidden_size, 1]
+             
+            w13_float = expert_w13_weight.to(dtype=torch.float32)
+            w2_float = expert_w2_weight.to(dtype=torch.float32)
+             
+            w13_scale_expanded = expert_w13_scale.expand_as(w13_float)  # [intermediate_size, hidden_size]
+            w2_scale_expanded = expert_w2_scale.expand_as(w2_float)  # [hidden_size, intermediate_size]
+             
+            w13_fp32 = w13_float * w13_scale_expanded
+            w2_fp32 = w2_float * w2_scale_expanded
+             
+            w13_fp32_list.append(w13_fp32)
+            w2_fp32_list.append(w2_fp32)
+             
+            del expert_w13_weight, expert_w13_scale, expert_w2_weight, expert_w2_scale
+            del w13_float, w2_float, w13_scale_expanded, w2_scale_expanded
+            del w13_fp32, w2_fp32
+         
+        w13_fp32_tensor = torch.stack(w13_fp32_list, dim=0).cpu()
+        w2_fp32_tensor = torch.stack(w2_fp32_list, dim=0).cpu()
+         
+        w13_fp32_list.clear()
+        w2_fp32_list.clear()
+    
+        del w13_fp32_list, w2_fp32_list
+         
+        w13_weight_ptr = w13_fp32_tensor.contiguous().data_ptr()
+        w2_weight_ptr = w2_fp32_tensor.contiguous().data_ptr()
+         
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+         
+        group_size = getattr(self.quant_method, 'group_size', 32)
+         
+        num_bits = 4 if moe_compute_strategy == MoeComputeStrategy.INT4 else 8
+         
+        num_processes, process_id = self._get_processes_info()
+         
+        self.lk_moe_config = lk_moe.MOE_Quant_Config(
+            num_processes,                     # num_processes
+            process_id,                        # process_id
+            self.moe_runner_config.num_local_experts,            # expert_num
+            self.top_k,                        # routed_expert_num
+            self.hidden_size,                  # hidden_size
+            self.intermediate_size_per_partition,  # intermediate_size
+            32,                                # stride
+            10,                                # group_min_len
+            1024,   # group_max_len
+            hidden_ggml_type,                  # hidden_type 
+            0,                                 # weight_data_type: 0 for fp32
+            w13_weight_ptr,                    # w13_weight_ptr 
+            w2_weight_ptr,                     # w2_weight_ptr   
+            group_size,                        # group_size 
+            num_bits,                          # num_bits 
+        )
+         
+        self.lk_moe = lk_moe.MOE_Quant(self.lk_moe_config)
+        
+        del w13_weight_ptr, w2_weight_ptr
+        del w13_fp32_tensor, w2_fp32_tensor
+ 
+        import gc
+        gc.collect()
+            
+    def _process_channel_weights(self):  
+         
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_weight_scale = self.w13_weight_scale
+        w2_weight_scale = self.w2_weight_scale
+        
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+        w13_ggml_type = hidden_ggml_type
+        w2_ggml_type = hidden_ggml_type
+            
+        w13_projs = []
+        w2_projs = [] 
+             
+        num_experts, total_intermediate_size, hidden_size = w13_weight.shape
+        intermediate_size = total_intermediate_size // 2 
+        assert w2_weight.shape == (num_experts, hidden_size, intermediate_size), f"Down weight shape {w2_weight.shape} must be (num_experts, hidden_size, intermediate_size)"
+        
+        scale_num_experts, scale_total_intermediate_size, _ = w13_weight_scale.shape
+        scale_intermediate_size = scale_total_intermediate_size // 2
+        
+        assert w2_weight_scale.shape == (scale_num_experts, hidden_size, 1), f"Down weight scale shape {w2_weight_scale.shape} must be (scale_num_experts, scale_hidden_size, 1)"
+        
+        
+        dequant_device = 'cpu'
+        
+        w13_buf = torch.zeros(intermediate_size, hidden_size, dtype=torch.float32, device=dequant_device, requires_grad=False) 
+        w2_buf = torch.zeros(hidden_size, intermediate_size, dtype=torch.float32, device=dequant_device, requires_grad=False)
+        
+        for expert_idx in range(num_experts): 
+            expert_w13_weight = w13_weight[expert_idx].to(dequant_device)  # shape: [1408, 4096]
+            expert_w13_scale = w13_weight_scale[expert_idx].to(dequant_device)    # shape: [1408, 1]
+            expert_w2_weight = w2_weight[expert_idx].to(dequant_device)    # shape: [4096, 1408]
+            expert_w2_scale = w2_weight_scale[expert_idx].to(dequant_device)  # shape: [4096, 1]
+            
+            w13_float = expert_w13_weight.to(dtype=torch.float32)
+            w2_float = expert_w2_weight.to(dtype=torch.float32) 
+             
+                
+            w13_scale_expanded = expert_w13_scale.expand_as(w13_float)
+            w2_scale_expanded = expert_w2_scale.expand_as(w2_float)
+                
+            w13_buf = w13_float * w13_scale_expanded 
+            w2_buf = w2_float * w2_scale_expanded 
+            
+            w13_projs.append(w13_buf.to(dtype=self.moe_runner_config.params_dtype)) 
+            w2_projs.append(w2_buf.to(dtype=self.moe_runner_config.params_dtype))
+            
+            del expert_w13_weight, expert_w13_scale, expert_w2_weight, expert_w2_scale 
+            del w13_float, w2_float, w13_scale_expanded, w2_scale_expanded
+            del w13_buf, w2_buf  
+            
+        w13_tensor = torch.stack(w13_projs, dim=0).to('cpu')
+        w2_tensor = torch.stack(w2_projs, dim=0).to('cpu') 
+        del w13_projs, w2_projs  
+        
+        w13_ptr = w13_tensor.contiguous().data_ptr()
+        w2_ptr = w2_tensor.contiguous().data_ptr()       
+          
+        num_processes, process_id = self._get_processes_info()
+        
+        self.lk_moe_config = lk_moe.MOEConfig(
+            num_processes,                # num_processes
+            process_id,                   # process_id
+            self.moe_runner_config.num_local_experts,        # expert_num
+            self.top_k,                    # routed_expert_num
+            self.hidden_size,              # hidden_size
+            self.intermediate_size_per_partition,             # intermediate_size
+            32,                            # stride
+            10,                            # group_min_len
+            1024,                          # group_max_len 
+            hidden_ggml_type,                # hidden_type  
+            w13_ggml_type,                  # w13_type  
+            w2_ggml_type,                # w2_type   
+            w13_ptr,                 # w13_proj
+            w2_ptr,                   # w2_proj 
+        ) 
+        self.lk_moe = lk_moe.MOE(self.lk_moe_config)
+        
+        del w13_tensor, w2_tensor
+        del w13_ptr, w2_ptr 
+        
+        
+        import gc
+        gc.collect()
+            
+    def _process_regular_weights(self):  
+               
+        w13_ggml_type = self.get_ggml_type_from_dtype(self.w13_weight.dtype)
+        w2_ggml_type = self.get_ggml_type_from_dtype(self.w2_weight.dtype ) 
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_runner_config.params_dtype)
+     
+        num_experts, total_intermediate_size, hidden_size = self.w13_weight.shape
+        intermediate_size = total_intermediate_size // 2
+        
+        assert self.w13_weight.shape == (num_experts, self.intermediate_size_per_partition * 2, self.hidden_size), f"Up weight shape {self.w13_weight.shape} must be (num_experts, total_intermediate_size, hidden_size)"
+        
+        assert self.w2_weight.shape == (num_experts, self.hidden_size, self.intermediate_size_per_partition), f"Down weight shape {self.w2_weight.shape} must be (num_experts, hidden_size, intermediate_size)"
+        
+        w13_ptr = self.w13_weight.contiguous().data_ptr()
+        w2_ptr = self.w2_weight.contiguous().data_ptr()
+        
+        num_processes, process_id = self._get_processes_info()
+        
+        self.lk_moe_config = lk_moe.MOEConfig(
+            num_processes,                # num_processes
+            process_id,                   # process_id
+            num_experts,        # expert_num
+            self.top_k,                    # routed_expert_num
+            self.hidden_size,              # hidden_size
+            self.intermediate_size_per_partition,             # intermediate_size
+            32,                            # stride
+            10,                            # group_min_len
+            1024,                          # group_max_len
+            hidden_ggml_type,            
+            w13_ggml_type,                # gate_type  
+            w2_ggml_type,                # down_type  
+            w13_ptr,                 # w13_ptr 
+            w2_ptr,                 # w2_ptr 
+        ) 
+        self.lk_moe = lk_moe.MOE(self.lk_moe_config)  
+        del w13_ptr, w2_ptr
+        import gc
+        gc.collect()
+        
+    def forward_lk(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        return self._process_valid_inputs(hidden_states, topk_weights, topk_ids)
+  
+    def _initialize_cuda_graph_buffers(self): 
+        if not hasattr(FusedMoE, 'cuda_graphs'): 
+            
+            if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
+                batch_size = self.max_running_requests * (1 + self.speculative_num_draft_tokens)
+            else:
+                batch_size = self.max_running_requests
+            FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, batch_size+1, 8)) 
+             
+            FusedMoE.input_tensor_cpu = {}  # device_id -> buffers
+            FusedMoE.expert_ids_cpu = {}    # device_id -> buffers
+            FusedMoE.weights_cpu = {}       # device_id -> buffers
+            FusedMoE.output_cpu = {}        # device_id -> buffers
+            FusedMoE.bsz_tensor_cpu = {}    # device_id -> buffers
+            FusedMoE.output_gpu = {}        # device_id -> buffers
+            
+            current_device = torch.cuda.current_device()
+    
+            num_experts_per_tok = self.top_k
+            hidden_size = self.hidden_size
+            buff_dtype = self.moe_runner_config.params_dtype
+             
+            pin_memory = is_pin_memory_available()
+            
+            FusedMoE.output_gpu[current_device] = [
+                torch.zeros((batch_size, hidden_size), device=current_device, dtype=buff_dtype, requires_grad=False).contiguous()
+                for batch_size in FusedMoE.cuda_graphs
+            ]
+            
+            FusedMoE.input_tensor_cpu[current_device] = [
+                torch.zeros((batch_size, self.hidden_size), device="cpu", dtype=buff_dtype, pin_memory=pin_memory, requires_grad=False).contiguous()
+                for batch_size in FusedMoE.cuda_graphs
+            ]
+            FusedMoE.expert_ids_cpu[current_device] = [
+                torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.int32, pin_memory=pin_memory, requires_grad=False).contiguous()
+                for batch_size in FusedMoE.cuda_graphs
+            ]
+            FusedMoE.weights_cpu[current_device] = [
+                torch.zeros((batch_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=pin_memory, requires_grad=False).contiguous()
+                for batch_size in FusedMoE.cuda_graphs
+            ]
+            FusedMoE.output_cpu[current_device] = [
+                torch.zeros((batch_size, hidden_size), device="cpu", pin_memory=pin_memory, dtype=buff_dtype, requires_grad=False).contiguous()
+                for batch_size in FusedMoE.cuda_graphs
+            ]
+            FusedMoE.bsz_tensor_cpu[current_device] = [
+                torch.zeros((1), device="cpu", dtype=torch.int32, pin_memory=pin_memory, requires_grad=False).contiguous()
+                for _ in range(len(FusedMoE.cuda_graphs))
+            ]
+         
+    def _find_best_graph_index(self, total_tokens: int) -> int:
+        if not hasattr(FusedMoE, 'cuda_graphs') or not FusedMoE.cuda_graphs:
+            raise ValueError("No CUDA graphs initialized.")
+        
+        cuda_graphs = FusedMoE.cuda_graphs
+        
+        low, high = 0, len(cuda_graphs) - 1
+        best_index = len(cuda_graphs) - 1  
+        
+        while low <= high:
+            mid = (low + high) // 2
+            if cuda_graphs[mid] >= total_tokens:
+                best_index = mid
+                high = mid - 1
+            else:
+                low = mid + 1
+         
+        if best_index >= len(cuda_graphs):
+            best_index = len(cuda_graphs) - 1
+             
+        if cuda_graphs[best_index] < total_tokens:
+            raise ValueError(f"No suitable CUDA graph found for {total_tokens} tokens. "
+                            f"Maximum available buffer size: {cuda_graphs[-1]}")
+        
+        return best_index
+    
+    def _process_valid_inputs(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
+        """Process inputs that are guaranteed to be valid (non-NaN)"""
+         
+ 
+        def get_cuda_stream_ptr(stream: torch.cuda.Stream) -> int:
+                """
+                Get the underlying CUDA stream pointer from a torch.cuda.Stream object.
+                """
+                if hasattr(stream, 'cuda_stream'):
+                    return stream.cuda_stream
+                elif hasattr(stream, 'stream'):
+                    return stream.stream
+                else:
+                    # Fallback to using the default stream
+                    return 0
+                  
+        batch_size = hidden_states.size(0)
+        stream = get_current_stream()
+        stream_ptr = get_cuda_stream_ptr(stream) 
+        non_blocking = True
+        current_device = torch.cuda.current_device()  
+       
+        try:   
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+            if torch.cuda.is_current_stream_capturing() or get_is_capture_mode():  
+                graph_index = self._find_best_graph_index(batch_size)
+                 
+                input_tensor_cpu = FusedMoE.input_tensor_cpu[current_device]
+                expert_ids_cpu = FusedMoE.expert_ids_cpu[current_device]
+                weights_cpu = FusedMoE.weights_cpu[current_device]
+                output_cpu = FusedMoE.output_cpu[current_device]
+                bsz_tensor_cpu = FusedMoE.bsz_tensor_cpu[current_device]
+                output_gpu = FusedMoE.output_gpu[current_device]
+                    
+                bsz_tensor_cpu[graph_index][0] = batch_size 
+
+                input_tensor_cpu[graph_index][:batch_size].copy_(hidden_states, non_blocking=non_blocking)
+                expert_ids_cpu[graph_index][:batch_size].copy_(topk_ids, non_blocking=non_blocking)
+                weights_cpu[graph_index][:batch_size].copy_(topk_weights, non_blocking=non_blocking) 
+                input_ptr = input_tensor_cpu[graph_index].data_ptr()
+                expert_ids_ptr = expert_ids_cpu[graph_index].data_ptr()
+                weights_ptr = weights_cpu[graph_index].data_ptr()
+                output_ptr = output_cpu[graph_index].data_ptr()   
+                self.lk_moe.submit_with_cuda_stream(
+                    stream_ptr, 
+                    batch_size,                                   # qlen
+                    expert_ids_cpu[graph_index].size(1),                     # k
+                    expert_ids_ptr,                  # expert_ids
+                    weights_ptr,                     # weights
+                    input_ptr,                       # input
+                    output_ptr,                      # output 
+                    bsz_tensor_cpu[graph_index].data_ptr()                   # bsz_tensor
+                )  
+                self.lk_moe.sync_with_cuda_stream(stream_ptr)  
+                
+                output_gpu[graph_index][:batch_size].copy_(output_cpu[graph_index][:batch_size], non_blocking=non_blocking) 
+                torch.nan_to_num(output_gpu[graph_index][:batch_size], nan=0.0, out=output_gpu[graph_index][:batch_size])
+                return output_gpu[graph_index][:batch_size]
+            else:  
+                if not hasattr(self, '_normal_prefill_lock'):
+                    self._normal_prefill_lock = threading.Lock() 
+                
+                with self._normal_prefill_lock:
+                    if not hasattr(self, '_normal_prefill_stream'):
+                        self._normal_prefill_stream = torch.cuda.Stream() 
+                        
+                    current_stream = torch.cuda.current_stream()
+                    wait_event = torch.cuda.Event()
+                    wait_event.record(current_stream)
+                    
+                    with torch.cuda.stream(self._normal_prefill_stream):
+                        self._normal_prefill_stream.wait_event(wait_event)
+                        
+                        expert_ids_cpu = topk_ids.to(dtype=torch.int32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
+                        weights_cpu = topk_weights.to(dtype=torch.float32, device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
+                        hidden_states_cpu = hidden_states.to(device='cpu', memory_format=torch.contiguous_format, non_blocking=non_blocking)
+                        output_cpu = torch.empty_like(hidden_states, device='cpu').contiguous()
+                        bsz_tensor = torch.tensor([hidden_states.size(0)], device='cpu', dtype=torch.int32).contiguous()
+                        
+                        self._normal_prefill_stream.synchronize()
+                        
+                        self.lk_moe.forward(
+                            hidden_states.size(0),                         # qlen
+                            expert_ids_cpu.size(1),                    # k
+                            expert_ids_cpu.data_ptr(),                 # expert_ids
+                            weights_cpu.data_ptr(),                    # weights
+                            hidden_states_cpu.data_ptr(),              # input
+                            output_cpu.data_ptr(),                     # output 
+                            bsz_tensor.data_ptr()                      # bsz_tensor
+                        )     
+                        output_gpu = output_cpu.to(torch.cuda.current_device(), non_blocking=non_blocking)
+                        torch.nan_to_num(output_gpu, nan=0.0, out=output_gpu)
+                        complete_event = torch.cuda.Event()
+                        complete_event.record(self._normal_prefill_stream)
+                    
+                    current_stream.wait_event(complete_event)
+        
+                    return output_gpu
+       
+        except Exception as e:
+            logger.error(f"lk_moe forward failed with error: {e}, falling back to default path") 
+            raise RuntimeError("lk_moe forward failed, fallback to default MoE implementation")
 
 class FlashInferFusedMoE(FusedMoE):
     def __init__(self, *args, **kwargs):

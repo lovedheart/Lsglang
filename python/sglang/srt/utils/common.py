@@ -4179,3 +4179,84 @@ def bind_to_closest_numa_node_cuda():
     if is_numa_available() and nvgpu_available():
         node_id = get_current_device_numa_node_cuda()
         numa_bind_to_node(node_id)
+        
+
+def get_str_env_var(var_name: str, default: str = None) -> str:
+    return os.getenv(var_name, default) 
+
+from enum import Enum
+class MoeComputeStrategy(str, Enum): 
+        TO_DTYPE = "TO_DTYPE"      
+        KEEP = "KEEP"              
+        INT8 = "INT8"             
+        INT4 = "INT4" 
+        
+def is_lk_moe_feature_enabled() -> bool:
+    try:
+        import  lk_moe  
+        return get_bool_env_var("LVLLM_MOE_NUMA_ENABLED")
+    except Exception as e:
+        print(f"Error: lk_moe is not available falling back to default behavior." , e)
+        return False
+def is_numa_interleave_enabled() -> bool:
+    return get_bool_env_var("LVLLM_ENABLE_NUMA_INTERLEAVE")
+
+def is_lk_moe_use_gpu_prefill() -> bool:
+    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") > 0
+
+def get_gpu_prefill_min_batch_size() -> int:
+    return get_int_env_var("LVLLM_GPU_PREFILL_MIN_BATCH_SIZE") 
+
+def get_moe_compute_strategy() -> MoeComputeStrategy: 
+    strategy = get_str_env_var("LVLLM_MOE_USE_WEIGHT")
+    if strategy is None:
+        return MoeComputeStrategy.INT4
+    try:
+        return MoeComputeStrategy(strategy.upper())
+    except ValueError: 
+        print(f"Warning: Invalid LVLLM_MOE_USE_WEIGHT value '{strategy}', using 'INT4'")
+        return MoeComputeStrategy.INT4
+
+def get_gpu_prefetch_window() -> int:
+    return get_int_env_var("LVLLM_GPU_PREFETCH_WINDOW", 1)
+
+def is_lk_moe_gpu_prefill_layer(layer_id: str) -> bool:
+    return is_lk_moe_use_gpu_prefill() and not is_lk_moe_gpu_resident_layer(layer_id)
+    
+def is_lk_moe_cpu_layer(layer_id: str)-> bool:
+
+    return is_lk_moe_feature_enabled() and not is_lk_moe_gpu_resident_layer(layer_id) and not is_lk_moe_gpu_prefill_layer(layer_id)
+    
+def is_lk_moe_gpu_resident_layer(layer_id: str) -> bool:
+    
+    if not is_lk_moe_feature_enabled():
+        return True
+     
+  
+    disabled_layers_env = get_str_env_var("LVLLM_GPU_RESIDENT_MOE_LAYERS", None)
+    if not disabled_layers_env:
+        return False   
+    
+    disabled_layers_env = disabled_layers_env.strip()
+    
+    disabled_layers = set()
+    for part in disabled_layers_env.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        
+        if '-' in part:
+            try:
+                start, end = map(int, part.split('-')) 
+                if start <= end:
+                    disabled_layers.update(range(start, end + 1))
+            except ValueError: 
+                continue
+        else:
+            try:
+                disabled_layers.add(int(part))
+            except ValueError: 
+                continue
+     
+    return layer_id in disabled_layers
+ 

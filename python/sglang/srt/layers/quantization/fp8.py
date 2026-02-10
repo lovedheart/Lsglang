@@ -705,6 +705,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -741,6 +745,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size // 8,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -750,6 +755,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition // 8,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -760,6 +766,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * intermediate_size_per_partition,
                     hidden_size,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -769,6 +776,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     hidden_size,
                     intermediate_size_per_partition,
                     dtype=params_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -789,6 +797,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=scale_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -798,6 +807,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     (hidden_size + block_n - 1) // block_n,
                     (intermediate_size_per_partition + block_k - 1) // block_k,
                     dtype=scale_dtype,
+                    device=device,
                 ),
                 requires_grad=False,
             )
@@ -814,10 +824,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, 2, dtype=torch.float32, device=device), requires_grad=False
             )
             w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
@@ -829,11 +839,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         num_experts,
                         2 * intermediate_size_per_partition,
                         dtype=torch.float32,
+                        device=device,
                     ),
                     requires_grad=False,
                 )
                 w2_weight_scale1 = torch.nn.Parameter(
-                    torch.ones(num_experts, hidden_size, dtype=torch.float32),
+                    torch.ones(num_experts, hidden_size, dtype=torch.float32, device=device),
                     requires_grad=False,
                 )
                 layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
@@ -869,13 +880,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
 
             w13_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
             )
             layer.register_parameter("w13_input_scale", w13_input_scale)
             set_weight_attrs(w13_input_scale, extra_weight_attrs)
 
             w2_input_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, dtype=torch.float32, device=device), requires_grad=False
             )
             layer.register_parameter("w2_input_scale", w2_input_scale)
             set_weight_attrs(w2_input_scale, extra_weight_attrs)
@@ -885,6 +896,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and  layer.is_cpu_layer:
+            return None
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic

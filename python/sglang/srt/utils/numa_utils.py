@@ -14,11 +14,17 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def configure_subprocess(server_args: ServerArgs, gpu_id: int):
+    from sglang.srt.utils.common import is_numa_interleave_enabled
     if (
         numa_nodes := server_args.numa_node
     ) is not None and envs.SGLANG_NUMA_BIND_V2.get():
         numa_node = numa_nodes[gpu_id]
         numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
+        executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
+        with _mp_set_executable(executable=executable, debug_str=debug_str):
+            yield
+    elif is_numa_interleave_enabled():
+        numactl_args = "--interleave=all"
         executable, debug_str = _create_numactl_executable(numactl_args=numactl_args)
         with _mp_set_executable(executable=executable, debug_str=debug_str):
             yield
