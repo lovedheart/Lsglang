@@ -147,6 +147,7 @@ pip install torch==2.9.1 xformers
 ### 4. Install Lsglang
 
 ```bash
+pip install grpcio-tools
 MAX_JOBS=32 NVCC_THREADS=1 CMAKE_BUILD_TYPE=Release CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release" pip install -e "python" --no-build-isolation -vvv
 pip install nvidia-cudnn-cu12==9.16.0.29
 ```
