@@ -236,7 +236,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         if isinstance(layer, FusedMoE) and  layer.is_cpu_layer:
             return None
-        if _use_aiter:
+        # Skip aiter weight shuffle when using non-auto MoE backend (e.g., triton, triton_kernels)
+        # because aiter CK kernels don't support all GEMM dimensions
+        _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
+        if _should_use_aiter_moe:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -395,7 +398,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )[0]
             return StandardCombineInput(hidden_states=output)
         else:
-            if _use_aiter:
+            # Skip aiter fused_moe when using non-auto MoE backend (e.g., triton, triton_kernels)
+            # because aiter CK kernels don't support all GEMM dimensions
+            _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
+            if _should_use_aiter_moe:
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
