@@ -54,7 +54,9 @@ LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREAD
     --tensor-parallel-size 2 \
     --max-running-requests 4 \
     --tool-call-parser glm47 \
-    --reasoning-parser glm45
+    --reasoning-parser glm45 \
+    # --nsa-prefill-backend "tilelang" \
+    # --nsa-decode-backend "tilelang" 
 ```
 
 ## Supported Models
