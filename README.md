@@ -43,20 +43,37 @@ pip uninstall transformers -y
 pip install -e ".[torch]" --no-cache-dir
 ```
 
-3、Run GLM5 [SM90 architecture and above]
+3、Run GLM5 [SM90 SM100 architecture]
 ```bash 
-LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=44 OMP_NUM_THREADS=44 LVLLM_MOE_USE_WEIGHT=INT4 LVLLM_ENABLE_NUMA_INTERLEAVE=1 python -m sglang.launch_server \
+NCCL_SOCKET_IFNAME=lo \
+NCCL_IB_DISABLE=1 \
+GLOO_SOCKET_IFNAME=lo \
+NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
     --model "/home/guqiong/Models/GLM-5-FP8" \
     --served-model-name "GLM-5-FP8" \
     --host "0.0.0.0" \
     --port "8070" \
     --trust-remote-code \
     --tensor-parallel-size 2 \
+    --enable-p2p-check \
     --max-running-requests 4 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
+    --fp8-gemm-backend "triton" \
     # --nsa-prefill-backend "tilelang" \
-    # --nsa-decode-backend "tilelang" 
+    # --nsa-decode-backend "tilelang" \
+    --disable-shared-experts-fusion \
+    --attention-backend "flashinfer" \
+    --chunked-prefill-size 40000 \
+    --max-total-tokens 40000 \
+    --mem-fraction-static 0.90
 ```
 
 ## Supported Models

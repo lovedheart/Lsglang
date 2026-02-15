@@ -131,7 +131,7 @@ def launch_scheduler_process_only(
                 )
 
                 with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                    server_args, gpu_id
+                    server_args, gpu_id, server_args.tp_size
                 ):
                     proc.start()
 
