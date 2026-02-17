@@ -47,20 +47,21 @@ LK_THREAD_BINDING=CPU_CORE \
 LK_THREADS=44 \
 OMP_NUM_THREADS=44 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/Qwen3.5-397B-A17B" \
     --served-model-name "Qwen3.5-397B-A17B" \
-    --host "0.0.0.0" \
-    --port "8070" \
+    --host 0.0.0.0 \
+    --port 8070 \
     --trust-remote-code \
     --tensor-parallel-size 2 \
-    --enable-p2p-check \
     --max-running-requests 4 \
-    --disable-shared-experts-fusion \
-    --attention-backend "flashinfer" \
+    --enable-p2p-check \
     --chunked-prefill-size 4096 \
-    --max-total-tokens 16384 \
-    --mem-fraction-static 0.90 
+    --max-total-tokens 32768 \
+    --mem-fraction-static 0.90 \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3
 
 
     # Multi-Token Prediction (MTP) \
@@ -76,18 +77,17 @@ python -m sglang.launch_server \
 
 ## 如何运行MiniMax-M2.5
  
-```bash 
-# 未启用GPU预填充
-LVLLM_MOE_NUMA_ENABLED=1 \
-LK_THREAD_BINDING=CPU_CORE \
-LK_THREADS=44 OMP_NUM_THREADS=44 \
-LVLLM_MOE_USE_WEIGHT=INT4 \
-LVLLM_ENABLE_NUMA_INTERLEAVE=0 \
-LVLLM_MOE_QUANT_ON_GPU=1 \
+```bash
 NCCL_SOCKET_IFNAME=lo \
 NCCL_IB_DISABLE=1 \
 GLOO_SOCKET_IFNAME=lo \
 NCCL_SOCKET_TIMEOUT=600000 \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 OMP_NUM_THREADS=44 \
+LVLLM_MOE_USE_WEIGHT=INT4 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+LVLLM_MOE_QUANT_ON_GPU=1 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Downloads/MiniMax-M2.5" \
     --served-model-name MiniMax-M2.5 \
