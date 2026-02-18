@@ -28,7 +28,7 @@ Lsglang使用最新的sglang源码，重新设计实现了MOE模型混合推理�
 ## 版本变更
  
 ```bash  
-2026-02-26: Lsglang-v1.0.3 - 修复已知问题，增加新模型支持   
+2026-02-18: Lsglang-v1.0.3 - 修复已知问题，增加新模型支持   
 2026-02-10：Lsglang-v1.0.0 -  来自LvLLM项目[https://github.com/guqiong96/Lvllm]的移植，验证了BF16、F16原版模型、FP8原版模型、AWQ 4bit对称量化模型。
  
 ```
@@ -64,7 +64,8 @@ python -m sglang.launch_server \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3
+    --reasoning-parser qwen3 \
+    --attention-backend triton
 
 
     # Multi-Token Prediction (MTP) \
@@ -147,9 +148,9 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
-    --fp8-gemm-backend "triton" \
+    --fp8-gemm-backend triton \
     --disable-shared-experts-fusion \
-    --attention-backend "flashinfer" \
+    --attention-backend flashinfer \
     --chunked-prefill-size 40000 \
     --max-total-tokens 40000 \
     --mem-fraction-static 0.90

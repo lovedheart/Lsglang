@@ -28,7 +28,7 @@ Lsglang uses the latest sglang source code and has redesigned and implemented th
 ## Version Changes
 
 ```bash
-2026-02-26: Lsglang-v1.0.3 - fix known issues, support new models  
+2026-02-18: Lsglang-v1.0.3 - fix known issues, support new models  
 2026-02-10: Lsglang-v1.0.0 - Ported from the LvLLM project [https://github.com/guqiong96/Lvllm], verified BF16, F16 original models, FP8 original models, and AWQ 4-bit symmetric quantization models.
 ```
 
@@ -64,7 +64,8 @@ python -m sglang.launch_server \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --tool-call-parser qwen3_coder \
-    --reasoning-parser qwen3
+    --reasoning-parser qwen3 \
+    --attention-backend triton
 
 
     # Multi-Token Prediction (MTP) \
@@ -152,9 +153,9 @@ python -m sglang.launch_server \
     --max-running-requests 4 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
-    --fp8-gemm-backend "triton" \
+    --fp8-gemm-backend triton \
     --disable-shared-experts-fusion \
-    --attention-backend "flashinfer" \
+    --attention-backend flashinfer \
     --chunked-prefill-size 40000 \
     --max-total-tokens 40000 \
     --mem-fraction-static 0.90
