@@ -495,7 +495,7 @@ cd repo-fmt-src && git checkout 553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28 && cd .
 
 # 4. Triton
 git clone https://github.com/triton-lang/triton.git repo-triton-src
-cd repo-triton-src && git checkout v3.5.1 && cd ..
+cd repo-triton-src && git checkout 0add68262ab0a2e33b84524346cb27cbb2787356 && cd ..
 
 # 5. FlashInfer
 git clone https://github.com/flashinfer-ai/flashinfer.git repo-flashinfer-src
@@ -509,20 +509,23 @@ cd repo-flash-attention-src && git checkout bcf72ccc6816b36a5fae2c5a3c0276046297
 git clone https://github.com/microsoft/mscclpp.git repo-mscclpp-src
 cd repo-mscclpp-src && git checkout 51eca89d20f0cfb3764ccd764338d7b22cd486a6 && cd ..
 
-# 8. FlashMLA (可选，CUDA 12.4+)
+# 8. FlashMLA
 git clone https://github.com/sgl-project/FlashMLA.git repo-flashmla-src
-cd repo-flashmla-src && git checkout main && cd ..
+cd repo-flashmla-src && git checkout 9804b12079e4c873514d3457aa588d3ccf40da28 && cd ..
 
-# 9. DLPack (FlashInfer依赖)
+# 9. DLPack
 git clone https://github.com/dmlc/dlpack.git dlpack-src
+cd dlpack-src && git checkout 3ea601bb413074c49a77c4ce3218bc08f8c4703c && cd ..
 
-# 10. nanobind (FlashInfer依赖)
+# 10. nanobind
 git clone https://github.com/wjakob/nanobind.git nanobind-src
+cd nanobind-src && git checkout 05cba0ef85ba2bb68aa115af4b74c30aa2aa7bec && cd ..
 
-# 11. JSON (FlashInfer依赖)
+# 11. JSON
 wget https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
 tar -xf json.tar.xz
 mv json json-src
+rm json.tar.xz
  
 ``` 
 
