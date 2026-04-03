@@ -541,8 +541,6 @@ LVLLM_GPU_RESIDENT_MOE_LAYERS=0-5
  
 ### Enable GPU Prefill
 ```bash
-# to achieve optimal performance with GPU prefill enabled, include layer 0
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0  
 # Prefetch 1 layer, recommended value is 1, more is meaningless
 LVLLM_GPU_PREFETCH_WINDOW=1 
 # Start GPU prefill when input length reaches 4096, can be decreased or increased based on CPU prefill performance, starting prefill earlier or later

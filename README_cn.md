@@ -585,8 +585,6 @@ LVLLM_GPU_RESIDENT_MOE_LAYERS=0-5
 
 ### 开启GPU预填充
 ```bash
-# 开启GPU预填充包含0层方可发挥最佳性能
-LVLLM_GPU_RESIDENT_MOE_LAYERS=0 
 # 预取1层, 建议值为1, 多了无意义
 LVLLM_GPU_PREFETCH_WINDOW=1
 # 输入长度达到4096启动GPU prefill，根据cpu prefill性能可减小或加大， 提前或推后启动prefill
