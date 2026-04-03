@@ -46,7 +46,7 @@ Note 1: x86 CPUs with AVX2 or above instruction sets and Nvidia GPUs are support
 ```bash
 
 pip uninstall transformers -y
-pip install transformers==4.57.6
+pip install transformers==5.3.0
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -90,7 +90,7 @@ python -m sglang.launch_server \
   
 ```bash
 pip uninstall transformers -y
-pip install transformers==4.57.6
+pip install transformers==5.3.0
 
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
@@ -147,7 +147,7 @@ python -m sglang.launch_server \
 
 ```bash
 pip uninstall transformers -y
-pip install transformers==4.57.6
+pip install transformers==5.3.0
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
@@ -242,7 +242,7 @@ python -m sglang.launch_server \
 
 ```bash
 pip uninstall transformers -y
-pip install transformers==4.57.6
+pip install transformers==5.3.0
 
 sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 free -h
@@ -287,7 +287,7 @@ python -m sglang.launch_server \
 ```bash
 
 pip uninstall transformers -y
-pip install transformers==4.57.6
+pip install transformers==5.3.0
 
 PYTORCH_ALLOC_CONF=expandable_segments:True \
 SGLANG_FORCE_FP8_MARLIN=1 \
