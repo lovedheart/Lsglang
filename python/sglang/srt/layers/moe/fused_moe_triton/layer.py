@@ -1338,7 +1338,7 @@ class FusedMoE(torch.nn.Module):
                     FusedMoE._cpu_weights_placeholder[batch_id] = create_cpu_weights(self) 
                     FusedMoE._gpu_weights_placeholder[batch_id] = {}
                     for param_name in param_names:
-                        FusedMoE._gpu_weights_placeholder[batch_id][param_name] = torch.zeros_like(FusedMoE._cpu_weights_placeholder[batch_id][param_name], device=torch.cuda.current_device())
+                        FusedMoE._gpu_weights_placeholder[batch_id][param_name] = torch.zeros_like(FusedMoE._cpu_weights_placeholder[batch_id][param_name], device=torch.cuda.current_device(), memory_format=torch.contiguous_format)
                     FusedMoE._batch_usage[batch_id] = False
                 logger.info(f"Initialized lk_moe gpu prefill buffers with {batch_size} batches")
                  

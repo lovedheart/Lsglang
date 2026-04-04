@@ -192,9 +192,9 @@ def fused_moe_gguf(
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if activation == "silu":
-            silu_and_mul(out, x)
+            silu_and_mul(x, out)
         elif activation == "gelu":
-            gelu_and_mul(out, x)
+            gelu_and_mul(x, out)
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         return out

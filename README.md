@@ -229,7 +229,8 @@ python -m sglang.launch_server \
     --attention-backend triton \
     --fp8-gemm-backend triton \
     --kv-cache-dtype bf16 \
-    --disable-piecewise-cuda-graph
+    --disable-piecewise-cuda-graph \
+    --disable-shared-experts-fusion
 
 
 
