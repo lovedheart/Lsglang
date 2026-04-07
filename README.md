@@ -213,6 +213,8 @@ OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/GLM-5-FP8" \
     --served-model-name "GLM-5-FP8" \
@@ -224,7 +226,7 @@ python -m sglang.launch_server \
     --max-running-requests 2 \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
-    --chunked-prefill-size 4096 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \
@@ -263,6 +265,8 @@ OMP_NUM_THREADS=44 \
 LVLLM_MOE_USE_WEIGHT=INT4 \
 LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
 LVLLM_MOE_QUANT_ON_GPU=1 \
+LVLLM_GPU_PREFETCH_WINDOW=1 \
+LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
     --model "/home/guqiong/Models/Kimi-K2.5" \
     --served-model-name "Kimi-K2.5" \
@@ -274,7 +278,7 @@ python -m sglang.launch_server \
     --max-running-requests 2 \
     --tool-call-parser kimi_k2 \
     --reasoning-parser kimi_k2 \
-    --chunked-prefill-size 4096 \
+    --chunked-prefill-size 32000 \
     --max-total-tokens 32768 \
     --mem-fraction-static 0.90 \
     --attention-backend triton \

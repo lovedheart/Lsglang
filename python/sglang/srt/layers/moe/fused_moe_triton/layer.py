@@ -113,6 +113,9 @@ if is_lk_moe_feature_enabled():
 else:
     logger.error("Failed to import lk_moe module or LVLLM_MOE_NUMA_ENABLED is not set to 1, lk::MOE implementation will not be available")
     
+import threading
+_gpu_prefill_lock = threading.Lock()
+    
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
     if a2a_backend.is_none():
@@ -1068,16 +1071,22 @@ class FusedMoE(torch.nn.Module):
             if not self.should_use_gpu_prefill(hidden_states): 
                 return self.forward_impl(hidden_states, topk_output)
             else:
-            
-                moe_layers, forward_batch = get_moe_context() 
-                _current_forward_context = MoEForwardContext(moe_layers, forward_batch)
+                if _gpu_prefill_lock.acquire(blocking=False):
+                    try:
+                        moe_layers, forward_batch = get_moe_context() 
+                        _current_forward_context = MoEForwardContext(moe_layers, forward_batch)
         
-                moe_prefetch(self, self.layer_id, hidden_states, _current_forward_context, get_gpu_prefetch_window())
-                moe_wait_prefetch(self, hidden_states, _current_forward_context)
-                
-                fused_output =  self.forward_impl(hidden_states, topk_output) 
-                moe_cleanup(self, self.layer_id, hidden_states, _current_forward_context) 
-                return fused_output
+                        moe_prefetch(self, self.layer_id, hidden_states, _current_forward_context, get_gpu_prefetch_window())
+                        moe_wait_prefetch(self, hidden_states, _current_forward_context)
+                        
+                        fused_output =  self.forward_impl(hidden_states, topk_output) 
+                        moe_cleanup(self, self.layer_id, hidden_states, _current_forward_context) 
+                        return fused_output
+                    finally:
+                        _gpu_prefill_lock.release()
+                else:
+                    logger.debug("GPU prefill busy, fallback to normal path")
+                    return self.forward_impl(hidden_states, topk_output)
             
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
@@ -1341,7 +1350,8 @@ class FusedMoE(torch.nn.Module):
                 import threading
                 
                  
-                batch_size = min(self.max_running_requests, 4) 
+                # batch_size = min(self.max_running_requests, 4) 
+                batch_size = 1
                 
                 FusedMoE._batch_lock = threading.Lock()  
                 
