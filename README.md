@@ -20,7 +20,7 @@ Note 1: x86 CPUs with AVX2 or above instruction sets and Nvidia GPUs are support
 - [How to Run Qwen3.5-122B-A10B](#how-to-run-qwen35-122b-a10b)
 - [How to Run Qwen3.5-397B-A17B](#how-to-run-qwen35-397b-a17b)
 - [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
-- [How to Run GLM5](#how-to-run-glm5)
+- [How to Run GLM-5.1-FP8](#how-to-run-glm-51-fp8)
 - [How to Run Kimi K2.5](#how-to-run-kimi-k25)
 - [How to Run Qwen3-Coder-Next-FP8](#how-to-run-qwen3-coder-next-fp8)
 - [Supported Models](#supported-models)
@@ -189,9 +189,8 @@ python -m sglang.launch_server \
 ```bash
 # When encountering performance issues, try binding threads to NUMA nodes and reducing the number of threads
 ```
+## How to Run GLM-5.1-FP8
 
-## How to Run GLM5
- 
 ```bash  
 pip uninstall transformers -y
 pip install transformers==5.3.0
@@ -216,8 +215,8 @@ LVLLM_MOE_QUANT_ON_GPU=1 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
-    --model "/home/guqiong/Models/GLM-5-FP8" \
-    --served-model-name "GLM-5-FP8" \
+    --model "/home/guqiong/Models/GLM-5.1-FP8" \
+    --served-model-name "GLM-5.1-FP8" \
     --host "0.0.0.0" \
     --port "8070" \
     --trust-remote-code \
@@ -235,9 +234,7 @@ python -m sglang.launch_server \
     --disable-piecewise-cuda-graph \
     --disable-shared-experts-fusion
 
-
-
-    
+ 
     # --nsa-prefill-backend "tilelang" \
     # --nsa-decode-backend "tilelang" \
 ```
@@ -522,6 +519,7 @@ cd repo-mscclpp-src && git checkout 51eca89d20f0cfb3764ccd764338d7b22cd486a6 && 
 # 8. FlashMLA
 git clone https://github.com/sgl-project/FlashMLA.git repo-flashmla-src
 cd repo-flashmla-src && git checkout 9804b12079e4c873514d3457aa588d3ccf40da28 && cd ..
+git submodule update --init --recursive
 
 # 9. DLPack
 git clone https://github.com/dmlc/dlpack.git dlpack-src
