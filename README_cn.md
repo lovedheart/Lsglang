@@ -537,8 +537,8 @@ cd repo-mscclpp-src && git checkout 51eca89d20f0cfb3764ccd764338d7b22cd486a6 && 
 
 # 8. FlashMLA
 git clone https://github.com/sgl-project/FlashMLA.git repo-flashmla-src
-cd repo-flashmla-src && git checkout 9804b12079e4c873514d3457aa588d3ccf40da28 && cd ..
-git submodule update --init --recursive
+cd repo-flashmla-src && git checkout 9804b12079e4c873514d3457aa588d3ccf40da28 && git submodule update --init --recursive
+cd ..
 
 # 9. DLPack
 git clone https://github.com/dmlc/dlpack.git dlpack-src
