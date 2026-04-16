@@ -9,7 +9,7 @@ else()
     FetchContent_Declare(
         repo-flashmla
         GIT_REPOSITORY https://github.com/sgl-project/FlashMLA.git
-        GIT_TAG main 
+        GIT_TAG 9804b12079e4c873514d3457aa588d3ccf40da28 
         SOURCE_DIR ${FLASHMLA_SOURCE_DIR}
     )
     FetchContent_Populate(repo-flashmla)
