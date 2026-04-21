@@ -19,9 +19,9 @@ Note 1: x86 CPUs with AVX2 or above instruction sets and Nvidia GPUs are support
 - [Version Changes](#version-changes)
 - [How to Run Qwen3.5-122B-A10B](#how-to-run-qwen35-122b-a10b)
 - [How to Run Qwen3.5-397B-A17B](#how-to-run-qwen35-397b-a17b)
-- [How to Run MiniMax-M2.5](#how-to-run-minimax-m25)
+- [How to Run MiniMax-M2.7](#how-to-run-minimax-m27)
 - [How to Run GLM-5.1-FP8](#how-to-run-glm-51-fp8)
-- [How to Run Kimi K2.5](#how-to-run-kimi-k25)
+- [How to Run Kimi K2.6](#how-to-run-kimi-k26)
 - [How to Run Qwen3-Coder-Next-FP8](#how-to-run-qwen3-coder-next-fp8)
 - [Supported Models](#supported-models)
 - [Performance Reference](#performance-reference)
@@ -144,7 +144,7 @@ python -m sglang.launch_server \
 
 ```
 
-## How to Run MiniMax-M2.5
+## How to Run MiniMax-M2.7
 
 ```bash
 pip uninstall transformers -y
@@ -167,8 +167,8 @@ LVLLM_MOE_QUANT_ON_GPU=1 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
-    --model "/home/guqiong/Models/MiniMax-M2.5" \
-    --served-model-name MiniMax-M2.5 \
+    --model "/home/guqiong/Models/MiniMax-M2.7" \
+    --served-model-name MiniMax-M2.7 \
     --host 0.0.0.0 \
     --port 8070 \
     --trust-remote-code \
@@ -239,7 +239,7 @@ python -m sglang.launch_server \
     # --nsa-decode-backend "tilelang" \
 ```
 
-## How to Run Kimi K2.5
+## How to Run Kimi K2.6
 
 ```bash
 pip uninstall transformers -y
@@ -265,8 +265,8 @@ LVLLM_MOE_QUANT_ON_GPU=1 \
 LVLLM_GPU_PREFETCH_WINDOW=1 \
 LVLLM_GPU_PREFILL_MIN_BATCH_SIZE=2048 \
 python -m sglang.launch_server \
-    --model "/home/guqiong/Models/Kimi-K2.5" \
-    --served-model-name "Kimi-K2.5" \
+    --model "/home/guqiong/Models/Kimi-K2.6" \
+    --served-model-name "Kimi-K2.6" \
     --host "0.0.0.0" \
     --port "8070" \
     --trust-remote-code \
