@@ -68,6 +68,8 @@ from sglang.srt.layers.quantization.awq import AWQMoEMethod
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
 from sglang.srt.layers.quantization.mxfp4_marlin_moe import Mxfp4MarlinMoEMethod 
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import Mxfp4FlashinferTrtllmMoEMethod
+from sglang.srt.layers.quantization.compressed_tensors.schemes import CompressedTensorsWNA16MoE
+ 
 
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
@@ -1402,14 +1404,15 @@ class FusedMoE(torch.nn.Module):
             tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
             
     def _find_weight(self):
-        if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW4A4Nvfp4MoE):
+        if (isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW4A4Nvfp4MoE)) \
+          or isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) :
             self._process_nvfp4()
             return True
         if isinstance(self.quant_method, Mxfp4MarlinMoEMethod) or isinstance(self.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
             self._process_mxfp4()
             return True
             
-        if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and not (hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)):
+        if isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsWNA16MoE):
             self._process_wna16()
             return True
         
@@ -1459,7 +1462,8 @@ class FusedMoE(torch.nn.Module):
                 "w13_weight_packed", "w2_weight_packed", 
                 "w13_weight_scale", "w2_weight_scale", 
                 "w13_weight_scale_inv", "w2_weight_scale_inv",
-                "w13_weight_global_scale", "w2_weight_global_scale"]
+                "w13_weight_global_scale", "w2_weight_global_scale",
+                "w13_weight_scale_2", "w2_weight_scale_2"]
         for weight in weights:
             if hasattr(self, weight):
                 delattr(self, weight)
@@ -1478,7 +1482,7 @@ class FusedMoE(torch.nn.Module):
                   
     def _process_wna16(self): 
         
-        is_transposed = True
+        is_transposed = isinstance(self.scheme, CompressedTensorsWNA16MoE)
          
         if(is_transposed):
             w13_weight = self.w13_weight_packed.cpu().transpose(1, 2).contiguous().view(torch.uint8) 
@@ -1636,13 +1640,20 @@ class FusedMoE(torch.nn.Module):
     
     def _process_nvfp4(self):  
         
-        w13_weight = self.w13_weight_packed
-        w2_weight = self.w2_weight_packed
-         
+        if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod):
+            w13_weight = self.w13_weight
+            w2_weight = self.w2_weight
+            w13_weight_global_scale = self.w13_weight_scale_2
+            w2_weight_global_scale = self.w2_weight_scale_2
+            
+        else:
+            w13_weight = self.w13_weight_packed
+            w2_weight = self.w2_weight_packed
+            w13_weight_global_scale = self.w13_weight_global_scale
+            w2_weight_global_scale = self.w2_weight_global_scale
+            
         w13_weight_scale = self.w13_weight_scale
         w2_weight_scale = self.w2_weight_scale
-        w13_weight_global_scale = self.w13_weight_global_scale
-        w2_weight_global_scale = self.w2_weight_global_scale
          
          
         groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)

@@ -1697,6 +1697,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        device = torch.cuda.current_device()
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            device = "cpu"
         if not self.quant_config.is_checkpoint_nvfp4_serialized:
             raise ValueError(
                 "NVFP4 quantization was selected, "
@@ -1721,6 +1725,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1736,6 +1741,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 # 2 fp4 items are packed in the input dimension
                 intermediate_size_per_partition // 2,
                 dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1749,6 +1755,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 num_shards * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1767,6 +1774,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size,
                 intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=weight_scale_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=2,
@@ -1790,13 +1798,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             else (layer.num_local_experts,)
         )
         w13_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
+            data=torch.empty(w13_weight_scale_shape, dtype=torch.float32, device=device),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight_scale_2", w13_weight_scale_2)
 
         w2_weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(layer.num_local_experts, dtype=torch.float32),
+            data=torch.empty(layer.num_local_experts, dtype=torch.float32, device=device),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
@@ -1821,6 +1829,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        if isinstance(layer, FusedMoE) and not layer.is_gpu_resident_layer:
+            return None
         """Process FP4 MoE weights after loading from serialized checkpoint.
 
         Only supports pre-quantized checkpoints with FP8 weights and scales.
