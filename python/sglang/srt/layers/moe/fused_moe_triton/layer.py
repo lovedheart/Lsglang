@@ -1854,6 +1854,8 @@ class FusedMoE(torch.nn.Module):
             topk_ids.size(1),
             torch.cuda.current_stream().cuda_stream,
         ) 
+        if self.check_nan_in_output:
+            torch.nan_to_num(output, nan=0.0, out=output)
         return output
             
     
