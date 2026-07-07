@@ -1441,10 +1441,11 @@ class FusedMoE(torch.nn.Module):
         if tensor is not None:
             tensor.data = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
             
-    def _find_weight(self):
+    def _do_process_weights_after_loading(self) -> bool:
         if (isinstance(self.quant_method, CompressedTensorsFusedMoEMethod) and hasattr(self, "scheme") and isinstance(self.scheme, CompressedTensorsW4A4Nvfp4MoE)) \
           or isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod) :
-            self._process_nvfp4()
+            need_reciprocal_global_scale = isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+            self._process_nvfp4(need_reciprocal_global_scale)
             return True
         if isinstance(self.quant_method, Mxfp4MarlinMoEMethod) or isinstance(self.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
             self._process_mxfp4()
@@ -1478,11 +1479,8 @@ class FusedMoE(torch.nn.Module):
             return
         torch.cuda.synchronize()
         try:
-                 
-            find_weight = False  
             with torch.no_grad(): 
-                find_weight = self._find_weight()
-                if not find_weight: 
+                if not self._do_process_weights_after_loading():
                     logger.error("weight not found in layer, quant_method: %s", self.quant_method) 
                     return
                 
@@ -1556,6 +1554,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1620,6 +1619,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1656,6 +1656,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1673,28 +1674,22 @@ class FusedMoE(torch.nn.Module):
         
         
     
-    def _process_nvfp4(self):  
+    def _process_nvfp4(self, need_reciprocal_global_scale=False):  
         
-        if isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod):
-            w13_weight = self.w13_weight
-            w2_weight = self.w2_weight
-            w13_weight_global_scale = self.w13_weight_scale_2
-            w2_weight_global_scale = self.w2_weight_scale_2
-            
-        else:
-            w13_weight = self.w13_weight_packed
-            w2_weight = self.w2_weight_packed
-            w13_weight_global_scale = self.w13_weight_global_scale
-            w2_weight_global_scale = self.w2_weight_global_scale
-            
+        w13_weight = self.w13_weight_packed if hasattr(self, "w13_weight_packed") else self.w13_weight
+        w2_weight = self.w2_weight_packed if hasattr(self, "w2_weight_packed") else self.w2_weight
+         
         w13_weight_scale = self.w13_weight_scale
         w2_weight_scale = self.w2_weight_scale
+        w13_weight_global_scale = self.w13_weight_global_scale if hasattr(self, "w13_weight_global_scale") else self.w13_weight_scale_2
+        w2_weight_global_scale = self.w2_weight_global_scale if hasattr(self, "w2_weight_global_scale") else self.w2_weight_scale_2
          
          
         groupN, groupK = self._get_quant_params(w13_weight, w13_weight_scale, 2)
         
-        w13_weight_global_scale = 1.0 / w13_weight_global_scale
-        w2_weight_global_scale = 1.0 / w2_weight_global_scale
+        if need_reciprocal_global_scale:
+            w13_weight_global_scale = 1.0 / w13_weight_global_scale
+            w2_weight_global_scale = 1.0 / w2_weight_global_scale
          
         w13_weight_ptr = w13_weight.contiguous().data_ptr()
         w2_weight_ptr = w2_weight.contiguous().data_ptr()
@@ -1715,6 +1710,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1759,6 +1755,7 @@ class FusedMoE(torch.nn.Module):
         self.lk_moe_config.hidden_size = self.hidden_size
         self.lk_moe_config.intermediate_size = self.intermediate_size_per_partition
         self.lk_moe_config.max_batch_size = self.max_num_batched_tokens
+        self.lk_moe_config.max_num_seqs = self.max_num_seqs
         self.lk_moe_config.stride = 32
         self.lk_moe_config.group_min_len = 10
         self.lk_moe_config.group_max_len = self.max_num_group_batch_size
@@ -1784,17 +1781,17 @@ class FusedMoE(torch.nn.Module):
         if self.speculative_num_draft_tokens is not None and self.speculative_num_draft_tokens > 0:
             batch_size = self.max_running_requests * (
                 1 + self.speculative_num_draft_tokens
-            ) * 2
+            )
         else:
-            batch_size = self.max_running_requests * 2
+            batch_size = self.max_running_requests
             
-        batch_size = min(batch_size, 512)
+        batch_size = min(batch_size, 32)
         
         return batch_size
   
     def _initialize_cuda_graph_buffers(self): 
         if not hasattr(FusedMoE, 'cuda_graphs'):
-            max_batch_size = self._get_max_num_seqs()
+            max_batch_size = self.max_num_seqs
             FusedMoE.cuda_graphs = [1, 2, 4] + list(range(8, max_batch_size + 1, 8))
             
             current_device = torch.cuda.current_device()
