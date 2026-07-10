@@ -59,7 +59,7 @@ Lsglang已验证的大部分原版MOE模型
 | MiniMax-M2.7 | ✅ 已测试通过 |
 | MiniMax-M2.5 | ✅ 已测试通过 |
 | MiniMax-M2.1 | ✅ 已测试通过 |
-| GLM-5.2-GLM-5.2-NVFP4 | ✅ 已测试通过[sm120] |
+| GLM-5.2-GLM-5.2-NVFP4 | ✅ 已测试通过 |
 | GLM-5.1-FP8 | ✅ 已测试通过 |
 | GLM-5.0-FP8 | ✅ 已测试通过 |
 | GLM-4.7 | ✅ 已测试通过 |

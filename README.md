@@ -59,7 +59,7 @@ Most original MOE models verified by Lsglang
 | MiniMax-M2.7 | ✅ Tested |
 | MiniMax-M2.5 | ✅ Tested |
 | MiniMax-M2.1 | ✅ Tested |
-| GLM-5.2-GLM-5.2-NVFP4 | ✅ 已测试通过[sm120] |
+| GLM-5.2-GLM-5.2-NVFP4 | ✅ Tested |
 | GLM-5.1-FP8 | ✅ Tested |
 | GLM-5.0-FP8 | ✅ Tested |
 | GLM-4.7 | ✅ Tested |
