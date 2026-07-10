@@ -145,8 +145,43 @@ python -m sglang.launch_server \
     --tool-call-parser glm47 \
     --reasoning-parser glm45 \
     --disable-shared-experts-fusion \
-    --disable-piecewise-cuda-graph \
+    -cuda-graph-backend-prefill disabled \
     --attention-backend triton
+
+# 或者使用flashinfer
+    --attention-backend flashinfer
+
+
+```
+
+
+### GLM-5.2-NVFP4 [RTX 3090 * 2]
+```bash 
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+LVLLM_MOE_NUMA_ENABLED=1 \
+LK_THREAD_BINDING=CPU_CORE \
+LK_THREADS=44 \
+OMP_NUM_THREADS=44 \
+LVLLM_ENABLE_NUMA_INTERLEAVE=1 \
+python -m sglang.launch_server \
+    --model /home/guqiong/Models/GLM-5.2-NVFP4 \
+    --served-model-name GLM-5.2-NVFP4 \
+    --host 0.0.0.0 \
+    --port 8070 \
+    --trust-remote-code \
+    --tensor-parallel-size 2 \
+    --max-running-requests 2 \
+    --chunked-prefill-size 256 \
+    --max-total-tokens 8192 \
+    --mem-fraction-static 0.98 \
+    --kv-cache-dtype bfloat16 \
+    --attention-backend triton \
+    --moe-runner-backend marlin \
+    --cuda-graph-backend-prefill disabled \
+    --disable-shared-experts-fusion \
+    --tool-call-parser glm47 \
+    --reasoning-parser glm45
 
 # 或者使用flashinfer
     --attention-backend flashinfer
